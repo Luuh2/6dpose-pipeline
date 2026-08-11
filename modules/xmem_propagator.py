@@ -10,9 +10,10 @@ from typing import List
 class XMemPropagator:
     """XMem mask 传播器 — MaskMapper API (兼容 single_object=False)"""
 
-    def __init__(self, model_path="E:/zhijiyige/weights/xmem/XMem-s012.pth",
-                 device="cuda:0", resolution=360, segment_length=200, segment_overlap=5):
-        sys.path.insert(0, "E:/zhijiyige/src/XMem")
+    def __init__(self,
+                 model_path="/mnt/20T/xieyongling/zhijiyige/weights/xmem/XMem-s012.pth",
+                 device="cuda:0", resolution=720, segment_length=200, segment_overlap=5):
+        sys.path.insert(0, "/mnt/20T/xieyongling/zhijiyige/src/XMem")
         from model.network import XMem
         from inference.inference_core import InferenceCore
         from inference.data.mask_mapper import MaskMapper
@@ -35,7 +36,8 @@ class XMemPropagator:
         from inference.data.mask_mapper import MaskMapper
 
         h_orig, w_orig = frames[0].shape[:2]
-        scale = self.resolution / min(h_orig, w_orig)
+        # 目标短边 = min(resolution, 源短边) — 不超过原生分辨率, 避免无意义放大
+        scale = min(1.0, self.resolution / min(h_orig, w_orig))
         h_proc, w_proc = int(h_orig * scale), int(w_orig * scale)
         n_frames = len(frames)
 

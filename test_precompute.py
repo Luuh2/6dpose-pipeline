@@ -140,7 +140,7 @@ def main():
     # ── M2: 检测 (带深度验证) ────────────────────────────────────
     print("\n[M2] Detecting object (depth-verified)...")
     yolo = YOLOWorldDetector(
-        model_path="E:/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
+        model_path="/mnt/20T/xieyongling/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
         device=device, conf_threshold=0.20, use_world=False)
 
     if args.prompt:
@@ -155,7 +155,7 @@ def main():
     if detection is None:
         print("  ERROR: No object detected! Retrying with YOLO-World...")
         yolo2 = YOLOWorldDetector(
-            model_path="E:/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
+            model_path="/mnt/20T/xieyongling/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
             device=device, conf_threshold=0.10, use_world=True)
         detection = yolo2.auto_detect(frames[0], depth_m=depth_0)
         yolo2.unload(); del yolo2; gcuda()
@@ -174,7 +174,7 @@ def main():
     # ── M3: 分割 ──────────────────────────────────────────────────
     print("\n[M3] Segmenting...")
     sam = EfficientViTSAMSegmentor(
-        model_path="E:/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt",
+        model_path="/mnt/20T/xieyongling/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt",
         model_name="efficientvit-sam-l0", device=device)
     mask_0 = sam.segment_with_box(first_rgb, bbox)
     sam.unload(); del sam; gcuda()
@@ -200,8 +200,8 @@ def main():
         device=device, mc_resolution=128,
         output_dir=os.path.join(args.output, "meshes"),
         enable_fallback=True,
-        source_dir="E:/zhijiyige/src/TripoSR",
-        model_dir="E:/zhijiyige/weights/triposr",
+        source_dir="/mnt/20T/xieyongling/zhijiyige/src/TripoSR",
+        model_dir="/mnt/20T/xieyongling/zhijiyige/weights/triposr",
     )
     try:
         mesh_path, mesh_info = triposr.generate(
@@ -280,11 +280,11 @@ def main():
     mask_xmem_path = os.path.join(args.output, "intermediate", "masks_xmem_full.dat")
 
     try:
-        sys.path.insert(0, "E:/zhijiyige/src/XMem")
+        sys.path.insert(0, "/mnt/20T/xieyongling/zhijiyige/src/XMem")
         from modules.xmem_propagator import XMemPropagator
         propagator = XMemPropagator(
-            model_path="E:/zhijiyige/weights/xmem/XMem-s012.pth",
-            device=device, resolution=360,
+            model_path="/mnt/20T/xieyongling/zhijiyige/weights/xmem/XMem-s012.pth",
+            device=device, resolution=720,
             segment_length=200, segment_overlap=5)
         masks_mmap = propagator.propagate(
             frames, mask_0, output_memmap=mask_xmem_path)
@@ -305,10 +305,10 @@ def main():
         # 回退: 固定周期重检测 (每30帧)
         RE_DETECT_EVERY = 30
         yolo = YOLOWorldDetector(
-            model_path="E:/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
+            model_path="/mnt/20T/xieyongling/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
             device=device, conf_threshold=0.15, use_world=False)
         sam = EfficientViTSAMSegmentor(
-            model_path="E:/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt",
+            model_path="/mnt/20T/xieyongling/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt",
             model_name="efficientvit-sam-l0", device=device)
         masks_mmap = np.memmap(mask_memmap_path, dtype=np.uint8,
                                mode='w+', shape=(n_frames, h, w))

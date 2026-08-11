@@ -9,7 +9,7 @@ wsl_track_m8_m11.py — WSL2 端 FoundationPose 追踪 (M8-M11)
   /mnt/e/zhijiyige/output/
     intermediate/depths_metric.dat   # fp16 meters (每帧估计)
     intermediate/masks.dat           # uint8 (每30帧重检测的逐帧掩码)
-    meshes/proxy_mesh_aligned.glb    # mm 单位 mesh (MeshDepthAligner 输出)
+    meshes/proxy_mesh_stream3d_mm.glb    # mm 单位 mesh (MeshDepthAligner 输出)
     K.npy                            # 相机内参
 
 单位约定 (FoundationPose 要求一致):
@@ -26,7 +26,7 @@ wsl_track_m8_m11.py — WSL2 端 FoundationPose 追踪 (M8-M11)
 import sys, os, time, cv2, numpy as np, torch
 
 # ── sys.path 设置 ──────────────────────────────────────────────────────
-BASE = '/mnt/e/zhijiyige'
+BASE = '/mnt/20T/xieyongling/zhijiyige'
 sys.path.insert(0, f'{BASE}/src/nvdiffrast/nvdiffrast-main')
 sys.path.insert(0, f'{BASE}/src/FoundationPose')
 sys.path.insert(0, BASE)  # 以便 import modules/*
@@ -37,9 +37,9 @@ VIDEO = f'{BASE}/demo/test_mustard.mp4'
 DEPTHS = f'{OUT}/intermediate/depths_metric.dat'
 # 优先使用 XMem 时序掩码 (精确跟随物体), 失败时回退颜色检测
 MASKS = f'{OUT}/intermediate/masks_xmem_full.dat'
-MESH = f'{OUT}/meshes/proxy_mesh_aligned.glb'
+MESH = f'{OUT}/meshes/proxy_mesh_stream3d_mm.glb'
 K_PATH = f'{OUT}/K.npy'
-N_PTS = 3000
+N_PTS = 8000
 DEBUG = 0
 REANCHOR_EVERY = 30     # 每 N 帧用掩码质心重锚定一次 (防漂移)
 MIN_MASK_PX = 100       # 掩码质心有效的最小面积
@@ -121,22 +121,33 @@ AXIS_DELTA_DEG_STATIC = 8.0     # 静止时 roll 限幅 (度)
 EMA_MOTION_WEIGHT = 0.4         # 运动时主轴 EMA 权重 (调低 → 快响应)
 EMA_STATIC_WEIGHT = 0.25        # 静止时主轴 EMA 权重 (调高 → 强平滑)
 
-# ── 1. 加载视频帧 (360p) ─────────────────────────────────────────────
+# ── 1. 加载视频帧 (按数据实际分辨率, 不再硬编码 360p) ──────────────
 print('[1] Loading frames...')
 cap = cv2.VideoCapture(VIDEO)
+native = None
 frames = []
 fps = cap.get(cv2.CAP_PROP_FPS)
 while True:
     ret, f = cap.read()
     if not ret:
         break
-    h, w = f.shape[:2]
-    s = 360 / min(h, w)
-    frames.append(cv2.resize(f, (int(w * s), int(h * s))))
+    if native is None:
+        native = f.shape[:2]
+    frames.append(f)
 cap.release()
 n = len(frames)
-hp, wp = frames[0].shape[:2]
-print(f'  {n}f {wp}x{hp} @ {fps:.1f}fps')
+# 数据分辨率: 从 memmap 文件大小推断 (masks uint8, depths fp16)
+import math
+masks_px = os.path.getsize(MASKS) // n           # H*W
+nh, nw = native
+ratio = nw / nh
+Wp = int(round(math.sqrt(masks_px * ratio)))     # 保持宽高比
+Hp = masks_px // Wp
+hp, wp = Hp, Wp
+print(f'  {n}f, native={nw}x{nh}, data={wp}x{hp} @ {fps:.1f}fps')
+# 帧缩放到数据分辨率
+if (nh, nw) != (hp, wp):
+    frames = [cv2.resize(f, (wp, hp)) for f in frames]
 
 # ── 2. 加载预计算数据 ───────────────────────────────────────────────
 print('[2] Loading precomputed data...')
@@ -192,6 +203,14 @@ mesh_bbox_corners = np.array([
     [mx[0], mx[1], mx[2]], [mn[0], mx[1], mx[2]],
 ], dtype=np.float32)
 print(f'  mesh bbox corners: {mesh_bbox_corners.shape}')
+# ── 物体本体长轴 (bbox 最长边): 从固定网格一次性定义, 永久固定 ──
+# 轴修正 (mask 惯性主轴 / 主轴预测) 一律对齐此固定本体轴,
+# 不随当前帧点云/网格重新生成坐标轴。
+long_axis_idx = int(np.argmax(mx - mn))
+_axis_names = ['X', 'Y', 'Z']
+print(f'  [BodyFrame] 本体长轴 = {_axis_names[long_axis_idx]}'
+      f' ({(mx - mn)[long_axis_idx] * 1000:.0f}mm), '
+      f'轴修正将对齐此固定本体轴')
 
 # 采样模型点+法线 (如官方 run_demo.py 用 mesh.vertices)
 # 采样到 N_PTS 个点 (配准鲁棒性 + 内存平衡)
@@ -204,10 +223,10 @@ print(f'  sampled {len(pts)} points')
 # 使用默认 scorer/refiner (从 src/FoundationPose/weights 自动加载)
 fp = FoundationPose(
     model_pts=pts, model_normals=normals, mesh=mesh,
-    glctx=glctx, debug=DEBUG,
+    glctx=glctx, debug=DEBUG, debug_dir=os.path.join(OUT, "fp_debug"),
 )
 # 降低 rotation grid 以适配 6GB VRAM
-fp.make_rotation_grid(min_n_views=8, inplane_step=120)
+fp.make_rotation_grid(min_n_views=16, inplane_step=60)
 print(f'  rotation grid: {len(fp.rot_grid)} rots')
 print(f'  VRAM: {torch.cuda.memory_allocated()/1e9:.2f}GB')
 
@@ -357,8 +376,8 @@ def apply_axis_pred_to_pose(pose, pred_axis, K, motion_level=0.0):
     if pred_axis is None:
         return pose
     R = pose[:3, :3].copy()
-    # 当前 mesh X 轴在图像平面的方向
-    x_axis_cam = R[:, 0]
+    # 当前 mesh 本体长轴在图像平面的方向 (固定本体轴)
+    x_axis_cam = R[:, long_axis_idx]
     cur_alpha = np.arctan2(x_axis_cam[1], x_axis_cam[0])
     # 预测修正量 (环绕归一化, 限幅防发散)
     delta = wrap_angle_diff(pred_axis, cur_alpha)
@@ -442,9 +461,9 @@ def apply_axis_pose_fix(pose, target_axis, K, motion_level=0.0):
     """
     R = pose[:3, :3].copy()
 
-    # 当前 mesh 主轴 (X 轴) 在图像平面的投影方向
-    # 用 pose 的 X 轴列 (物体 x 轴在相机系方向) 的 2D 投影
-    x_axis_cam = R[:, 0]  # 物体 x 轴在相机系
+    # 当前 mesh 本体长轴在图像平面的投影方向 (固定本体轴)
+    # 用 pose 的本体长轴列 (固定网格定义) 的 2D 投影
+    x_axis_cam = R[:, long_axis_idx]  # 物体本体长轴在相机系
     cur_alpha = np.arctan2(x_axis_cam[1], x_axis_cam[0])
 
     # 目标: 将 cur_alpha 旋转到 target_axis
