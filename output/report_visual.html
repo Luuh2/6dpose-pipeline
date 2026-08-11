@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8">
+<title>6D Pose 追踪 — 完整可视化报告</title>
+<style>
+body{font-family:'Microsoft YaHei',sans-serif;max-width:1080px;margin:0 auto;padding:20px;background:#141b2d;color:#d0d8e8}
+h1{color:#00e5a0;border-bottom:2px solid #00e5a033;padding-bottom:8px}
+h2{color:#64b5f6;margin-top:28px}
+.card{background:#1b2437;border-radius:12px;padding:20px;margin:14px 0}
+img{max-width:100%;border-radius:8px;border:1px solid #333;margin:8px 0}
+table{border-collapse:collapse;width:100%}
+th{background:#0d1b2a;color:#00e5a0;padding:8px 12px;text-align:left}
+td{padding:6px 12px;border-bottom:1px solid #2a3550}
+.metric{display:inline-block;background:#0f2b3e;border-radius:8px;padding:10px 18px;margin:5px;text-align:center;min-width:90px}
+.metric .v{font-size:1.5em;font-weight:bold;color:#00e5a0}
+.metric .l{font-size:0.75em;color:#889}
+.ok{background:#003a2e;border-left:4px solid #00e5a0;padding:12px 16px;border-radius:0 8px 8px 0;margin:12px 0}
+</style></head><body>
+<h1>🎯 RGB 6D Pose 追踪 — 完整可视化报告</h1>
+<div class="card">
+<div class="metric"><div class="v">737</div><div class="l">帧数</div></div>
+<div class="metric"><div class="v">15.1fps</div><div class="l">追踪速度</div></div>
+<div class="metric"><div class="v">0.6°</div><div class="l">平均帧间旋转</div></div>
+<div class="metric"><div class="v">5.8°</div><div class="l">最大三轴跳变</div></div>
+<div class="metric"><div class="v">0-9px</div><div class="l">mask贴合</div></div>
+<div class="metric"><div class="v">0</div><div class="l">歧义解拒绝</div></div>
+</div>
+
+<h2>1. 检测 + 分割 (零样本)</h2>
+<p>COCO 检测 + 深度平面验证 → bottle, SAM 分割</p>
+<img src="data:image/png;base64,{det}">
+
+<h2>2. 完整分析图 (旋转轨迹 / 平移轨迹 / 旋转一致性)</h2>
+<img src="data:image/png;base64,{plots}">
+
+<h2>3. 关键旋转帧 (水平→竖直翻转)</h2>
+<p>帧0→300→610→736, 绿色=追踪框, 红色=XMem mask</p>
+<img src="data:image/png;base64,{rot}">
+
+<h2>4. 结果文件</h2>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td>output/poses.csv</td><td>737帧 6D位姿 (四元数+平移+置信度)</td></tr>
+<tr><td>output/tracking_vis.avi</td><td>追踪可视化视频 (绿色bbox+坐标轴)</td></tr>
+<tr><td>output/debug/analysis_plots.png</td><td>旋转/平移/一致性分析图</td></tr>
+<tr><td>output/debug/rot_consistent.png</td><td>大幅旋转段逐帧对比</td></tr>
+</table>
+
+<div class="ok">✅ 全流程验证通过: 初始化mask屏蔽 → 首帧roll约束 → track_one+主轴预测 → 旋转一致性校验 → LIEKF自适应融合 → 置信度兜底</div>
+</body></html>

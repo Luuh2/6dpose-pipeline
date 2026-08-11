@@ -1,0 +1,121 @@
+# =============================================================================
+# RGB 6D Pose Tracking Pipeline — Configuration
+# =============================================================================
+# 运行环境: 服务器 6×RTX 4090 (48GB), 单一 ego_env 环境
+# 项目目录: /mnt/20T/xieyongling/zhijiyige
+# 输入: 纯 RGB 视频 (无真值深度/掩码)
+# 输出: 物体 3D 检测 + 6D 位姿追踪轨迹
+# 核心: FoundationPose + 单目深度估计 + 单视图 3D 网格生成
+#
+# ⚠ 说明: 实际生效值以 test_precompute.py / scripts/wsl_track_m8_m11.py
+#         内的硬编码为准 (服务器路径)。本文件作为参数文档与尺度校准配置源。
+# =============================================================================
+
+# ---- 运行参数 (CLI 可覆盖) ----
+pipeline:
+  video_path: null           # 输入视频路径
+  text_prompt: null          # 物体描述 (如 "blue mug", "red bottle")
+  output_dir: "./output"     # 输出根目录
+  device: "cuda:0"
+
+# ---- M1: 视频解码 ----
+video:
+  target_short_edge: 720     # 短边缩放目标 (720p; 源视频低于 720p 保持原生)
+
+# ---- M2: 物体检测 (YOLO-World 零样本 / COCO降级 / 自动检测) ----
+detection:
+  method: "yolo_world"       # "yolo_world" 零样本 (fallback) | "yolov8_coco" COCO 降级
+  model_path: "/mnt/20T/xieyongling/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt"
+  conf_threshold: 0.20       # 检测置信度阈值 (放宽以增加召回)
+  # --prompt 为空时自动检测最显著前景物体 (无需文本描述)
+  # 主力: COCO 80类 → 过滤背景类 → 深度平面验证 → score×√area 排序
+
+# ---- M3: 分割 (EfficientViT-SAM) ----
+segmentation:
+  model_path: "/mnt/20T/xieyongling/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt"
+  model_name: "efficientvit-sam-l0"
+
+# ---- M4: Mask 传播 (XMem) ----
+mask_propagation:
+  enabled: true              # false → 逐帧重新检测+分割 (慢但更鲁棒)
+  model_path: "/mnt/20T/xieyongling/zhijiyige/weights/xmem/XMem-s012.pth"
+  xmem_source: "/mnt/20T/xieyongling/zhijiyige/src/XMem"
+  resolution: 360
+  segment_length: 200        # 分段长度 (长视频分段处理)
+  segment_overlap: 5
+
+# ---- M5: 单目深度估计 (Depth Anything V3) ----
+depth:
+  method: "da3"              # "da3" 度量深度 | "da2" 相对深度
+  model_path: "/mnt/20T/xieyongling/zhijiyige/weights/da3_metric"
+  every_n: 1                 # ★ 每帧估计 (代码内强制), 否则追踪跟丢
+  # DA3 同时输出度量深度 (m) + 相机内参 K, 这对 FoundationPose 至关重要
+
+# ---- M6: 单视图 3D 网格生成 (TripoSR) ----
+mesh:
+  method: "triposr"          # "triposr" | "bbox" 纯 bbox 代理 (Stream3D 已评估, 保留 TripoSR)
+  model_dir: "/mnt/20T/xieyongling/zhijiyige/weights/triposr"
+  source_dir: "/mnt/20T/xieyongling/zhijiyige/src/TripoSR"
+  mc_resolution: 128         # marching cubes 分辨率
+  enable_bbox_fallback: true # TripoSR OOM/失败时退化为 bbox 网格
+  output_dir: "./output/meshes"
+
+# ---- M7: 尺度对齐 (Mesh ↔ 度量深度) ----
+scale_alignment:
+  # 策略: DA3 输出度量深度 (m) → 从物体区域深度估算物理尺寸 →
+  #       缩放 TripoSR mesh 使两者尺度一致 (mm 单位)
+  method: "depth_guided"     # "depth_guided" 从深度估算 | "heuristic" 固定尺寸
+  default_object_size_mm: 100.0  # heuristic 模式下的默认物体尺寸
+
+# ---- M7b: 深度尺度校准 + 稳定性监控 (消除 DA3 偏差) ----
+depth_calibration:
+  enabled: true              # 启用尺度校准
+  # 参考尺寸 (必需): 已知物体尺寸 (mm), 必须来自独立于 DA3 深度的来源!
+  #   不能用 MeshDepthAligner 的 DA3 反投影尺寸 (循环依赖).
+  known_object_size_mm: null   # 例: 160.0 (芥末瓶对角线). null = 禁用校准
+  scale_min: 0.5             # 尺度比钳制下限 (防校准发散)
+  scale_max: 3.0             # 尺度比钳制上限
+  # 稳定性监控 (尺度校准前置条件):
+  stability:
+    enabled: true            # 过滤剧烈波动/异常跳变的深度帧
+    jump_threshold: 0.15     # 帧间深度中位数跳变阈值 (m)
+    max_deviation_ratio: 0.25  # mask 区域深度 std 相对中位数的最大比
+
+# ---- M8: FoundationPose 核心 ----
+foundationpose:
+  source_dir: "/mnt/20T/xieyongling/zhijiyige/src/FoundationPose"
+  # Real weight files on disk:
+  #   Scorer:  FoundationPosescorer.pth  (190MB, 2024-01-11)
+  #   Refiner: FoundationPoserefiner.pth (68MB,  2023-10-28)
+  scorer_path: "/mnt/20T/xieyongling/zhijiyige/weights/foundationpose/FoundationPosescorer.pth"
+  refiner_path: "/mnt/20T/xieyongling/zhijiyige/weights/foundationpose/FoundationPoserefiner.pth"
+  encoder_path: "/mnt/20T/xieyongling/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt"
+  n_pts: 8000                # 采样点数 (服务器 4090: 8000; 原 3060 为 3000)
+  model_scale: 100.0         # mesh 归一化→mm 尺度因子
+  render_resolution: 144     # 渲染分辨率
+
+# ---- M9: SE(3) Kalman 滤波器 ----
+kalman:
+  enabled: true
+  dt: 0.033                  # 1/30 fps
+  process_noise_pos: 0.01    # 位置过程噪声 (m)
+  process_noise_rot: 0.001   # 旋转过程噪声 (rad)
+  measurement_noise_pos: 0.005
+  measurement_noise_rot: 0.002
+
+# ---- M10: 失败检测 + 自动恢复 ----
+failure_detection:
+  enabled: true
+  mask_area_threshold: 0.50  # 掩码面积相对首帧的比例下限
+  confidence_threshold: 0.35 # FoundationPose 置信度下限
+  recovery_lookback: 5       # 恢复时回退帧数
+  enable_recovery: true      # 是否自动重检测+重注册
+
+# ---- M11: 输出 ----
+output:
+  csv_path: "./output/poses.csv"
+  vis_video_path: "./output/tracking_vis.mp4"
+  render_fps: 30.0
+  save_depth_vis: false      # 是否同时保存深度可视化
+  save_mask_vis: false       # 是否同时保存掩码可视化
+  intermediate_dir: "./output/intermediate"  # memmap 中间结果目录

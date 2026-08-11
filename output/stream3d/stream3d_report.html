@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8">
+<title>Stream3D vs TripoSR 重建对比</title>
+<style>
+body{font-family:'Microsoft YaHei',sans-serif;max-width:1000px;margin:0 auto;padding:20px;background:#141b2d;color:#d0d8e8}
+h1{color:#00e5a0;border-bottom:2px solid #00e5a033;padding-bottom:8px}
+h2{color:#64b5f6;margin-top:24px}
+img{max-width:100%;border-radius:8px;border:1px solid #333;margin:8px 0}
+table{border-collapse:collapse;width:100%}
+th{background:#0d1b2a;color:#00e5a0;padding:8px 12px;text-align:left}
+td{padding:6px 12px;border-bottom:1px solid #2a3550}
+.good{color:#00e5a0;font-weight:bold}
+</style></head><body>
+<h1>🎯 Stream3D vs TripoSR 重建对比</h1>
+<p>demo/test_mustard.mp4 | Stream3D 流式多视图重建 vs TripoSR 首帧静态重建</p>
+
+<h2>网格对比</h2>
+<table>
+<tr><th>指标</th><th>TripoSR (首帧静态)</th><th>Stream3D (流式多视图)</th></tr>
+<tr><td>顶点数</td><td>15,780</td><td class="good">173,770</td></tr>
+<tr><td>背面几何覆盖</td><td>23%</td><td class="good">36% (+57%)</td></tr>
+<tr><td>z 厚度 (背面深度)</td><td>0.062m</td><td class="good">0.272m (4.4x)</td></tr>
+<tr><td>侧面/正面覆盖</td><td>50%/28%</td><td class="good">28%/36%</td></tr>
+</table>
+
+<h2>网格可视化 (侧面视角, 展示背面)</h2>
+<img src="data:image/png;base64,{img}">
+
+<h2>结论</h2>
+<div class="good">
+<b>Stream3D 成功补全了背面几何:</b><br>
+- 背面覆盖从 23% 提升到 36% (多视图看到物体不同侧面)<br>
+- z 方向厚度从 0.06m 扩展到 0.27m (含背面/侧面信息)<br>
+- 网格分辨率 11x (17万顶点 vs 1.6万)
+</div>
+</body></html>
