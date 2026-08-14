@@ -242,6 +242,65 @@ FoundationPose 拿到**物理上一致的 mesh 和深度**，无需启发式假�
 
 > **Stream3D** 流式多视图重建能补全背面几何（背面覆盖 23%→36%），结合本体轴固定修复后，追踪质量全面优于 TripoSR（IoU 0.58 vs 0.47，朝向误差 5.9° vs 4.6°，细长形态更贴合物体）。配套「本体坐标系固定原则」见[改进 4](#改进-4多观测引导追踪★-追踪跟得上的关键)。
 
+#### Stream3D 两遍流程（方法）
+
+**为什么需要两遍**：Stream3D 需要多视图位姿做输入，而位姿来自追踪；所以先用 TripoSR 首帧网格做一遍追踪得到位姿，再用 Stream3D 重建更优网格，最后重新追踪。
+
+```
+第 1 遍 (TripoSR 网格)                    第 2 遍 (Stream3D 网格)
+┌──────────────┐   poses.csv   ┌─────────────────┐
+│ 预计算 (M1-M7)│ ────────────→ │ 预计算已含首帧网格 │
+│  + 初始追踪    │   (逐帧位姿)   │  + prepare数据    │
+└──────────────┘                └────────┬────────┘
+                                         │
+                                 ┌───────▼───────┐
+                                 │ Stream3D 重建  │ → result.glb
+                                 └───────┬───────┘
+                                         │ 尺度对齐 → proxy_mesh_stream3d_mm.glb
+                                         ▼
+                                 ┌──────────────┐
+                                 │ 最终追踪 (M8) │ → 输出位姿/视频
+                                 └──────────────┘
+```
+
+**具体步骤**（服务器上执行）：
+
+```bash
+cd /mnt/20T/xieyongling/zhijiyige
+
+# 1. 预计算 (M1-M7) — 检测/分割/深度/TripoSR首帧网格/XMem
+~/miniconda3/envs/ego_env/bin/python test_precompute.py \
+    --video demo/<视频>.mp4 --prompt "<物体>" --output ./output_<名称>
+
+# 2. 第 1 遍追踪 (TripoSR 网格) — 得到逐帧位姿
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+~/miniconda3/envs/ego_env/bin/python scripts/wsl_track_m8_m11.py \
+    --out output_<名称> --video demo/<视频>.mp4
+
+# 3. 准备 Stream3D 输入 (图像/掩码/深度/位姿, 采样多视图)
+~/miniconda3/envs/ego_env/bin/python scripts/prepare_stream3d_data.py \
+    --frames demo/<视频>.mp4 \
+    --poses output_<名称>/poses.csv \
+    --masks output_<名称>/intermediate/masks_xmem_full.dat \
+    --depths output_<名称>/intermediate/depths_metric.dat \
+    --K output_<名称>/K.npy \
+    --out /mnt/20T/xieyongling/stream3d_data/<名称> \
+    --sample_every 4
+
+# 4. Stream3D 流式重建 → stream3d_out/<名称>/chunk_XXXX/result.glb
+#    (用 /tmp/STREAM3D/custom_case/run_custom_case.sh, env=stream3d)
+
+# 5. 尺度对齐 → proxy_mesh_stream3d_mm.glb
+#    (MeshDepthAligner: depth_guided, 用首帧深度+掩码)
+
+# 6. 第 2 遍追踪 (Stream3D 网格) — 最终位姿
+~/miniconda3/envs/ego_env/bin/python scripts/wsl_track_m8_m11.py \
+    --out output_<名称> --video demo/<视频>.mp4 \
+    --mesh output_<名称>/meshes/proxy_mesh_stream3d_mm.glb
+```
+
+**实测效果**（鼠标视频）：贴合 82px→11px，IoU 0.373→0.472，IoU<0.3 帧 29%→1%。Stream3D 多视图补全网格侧面/背面，追踪框显著更贴合物体。
+
 ### 阶段 7：尺度对齐 (M7) ★
 
 | 项目 | 说明 |
