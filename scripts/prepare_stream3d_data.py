@@ -66,13 +66,14 @@ def main():
     n_pose = len(df)
     print(f'位姿: {n_pose}')
 
-    # memmap
+    # memmap — 用实际帧分辨率 (native 帧尺寸, 与 masks/depth 一致)
     h, w = frames[0].shape[:2]
     masks = np.memmap(args.masks, dtype=np.uint8, mode='r',
                       shape=(n_video, h, w))
     depths = np.memmap(args.depths, dtype=np.float16, mode='r',
                        shape=(n_video, h, w))
     K = np.load(args.K).astype(np.float32)
+    print(f'memmap: masks {masks.shape}, depths {depths.shape}')
 
     # 采样帧索引 (保证 masks/poses/depth 数量一致)
     n = min(n_video, n_pose)
@@ -80,15 +81,24 @@ def main():
     print(f'采样 {len(idxs)} 帧')
 
     pose_lines = []
+    last_mask = None  # 空掩码时沿用上一帧
     for out_i, vid_i in enumerate(idxs):
         # 帧号 (6 位, 以整数结尾)
         stem = f'{out_i:06d}'
 
-        # ── 图像 ──
-        cv2.imwrite(os.path.join(img_dir, f'{stem}.png'), frames[vid_i])
+        # ── 图像 (缩放到 360x480 匹配掩码/深度) ──
+        img = frames[vid_i]
+        if img.shape[:2] != (h, w):
+            img = cv2.resize(img, (w, h))
+        cv2.imwrite(os.path.join(img_dir, f'{stem}.png'), img)
 
         # ── 掩码 (单通道) ──
         m = masks[vid_i].astype(np.uint8)
+        if m.sum() == 0 and last_mask is not None:
+            m = last_mask.copy()  # 空掩码沿用上一帧, 避免 Stream3D 裁剪除零
+            print(f'  [warn] frame {vid_i} 空掩码, 沿用上一帧')
+        if m.sum() > 0:
+            last_mask = m.copy()
         cv2.imwrite(os.path.join(mask_dir, f'{stem}.png'), m)
 
         # ── 深度 npz {depth, intrinsics} ──

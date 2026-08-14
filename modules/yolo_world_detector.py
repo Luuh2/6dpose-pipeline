@@ -88,7 +88,7 @@ class YOLOWorldDetector:
 
     def __init__(
         self,
-        model_path: str = "E:/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
+        model_path: str = "/mnt/20T/xieyongling/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
         device: str = "cuda:0",
         conf_threshold: float = 0.20,
         use_world: bool = True,  # 默认启用 YOLO-World 零样本
@@ -96,7 +96,9 @@ class YOLOWorldDetector:
         from ultralytics import YOLO
 
         self.model = YOLO(model_path)
-        self.model.to(device)
+        self.model_path = model_path
+        # 不手动 .to(device): YOLO-World set_classes 文本编码在 CPU, 手动移 cuda 会
+        # 造成 predict 设备不匹配; ultralytics predict 会自动选择设备 (CUDA 可用则用).
         self.conf_threshold = conf_threshold
         self.use_world = use_world
         self._clip_ok = False
@@ -134,9 +136,11 @@ class YOLOWorldDetector:
         """
         text_list = [t.strip() for t in text_prompts.split(",") if t.strip()]
 
-        # YOLO-World 零样本
-        if self.use_world and self._clip_ok:
-            return self._detect_world(image, text_list)
+        # YOLO-World 零样本 (set_classes + predict 自带文本编码, 无需 open_clip)
+        if self.use_world:
+            dets = self._detect_world(image, text_list)
+            if dets:
+                return dets
 
         # COCO 降级 (支持中英文关键词)
         return self._detect_coco(image, text_list)
@@ -211,9 +215,31 @@ class YOLOWorldDetector:
     # ── 内部实现 ─────────────────────────────────────────────────────
 
     def _detect_world(self, image: np.ndarray, text_list: List[str]) -> List[Dict]:
-        """YOLO-World 零样本检测"""
-        self.model.set_classes(text_list)
-        results = self.model.predict(image, conf=self.conf_threshold, verbose=False)
+        """YOLO-World 零样本检测 (设备统一 + 失败重建自愈)"""
+        try:
+            self.model.set_classes(text_list)
+            try:
+                # 统一设备: 文本编码器与图像特征必须同设备, 避免 clip cuda/cpu 错位
+                self.model.model.to(self.device)
+            except Exception:
+                pass
+            results = self.model.predict(image, conf=self.conf_threshold,
+                                         verbose=False, device=self.device)
+        except Exception as e:
+            if ("device" in str(e).lower()
+                    or "expected all tensors" in str(e).lower()):
+                print(f"[YOLO-World] 检测设备异常 ({str(e)[:50]}), 重建模型重试...")
+                from ultralytics import YOLO as _YOLO
+                self.model = _YOLO(self.model_path)
+                self.model.set_classes(text_list)
+                try:
+                    self.model.model.to(self.device)
+                except Exception:
+                    pass
+                results = self.model.predict(image, conf=self.conf_threshold,
+                                             verbose=False, device=self.device)
+            else:
+                raise
         detections = []
         if len(results) > 0 and results[0].boxes is not None:
             boxes = results[0].boxes
@@ -241,7 +267,7 @@ class YOLOWorldDetector:
                     cls_id = COCO_CLASSES.index(coco_name)
                     target_class_ids.add(cls_id)
 
-        results = self.model.predict(image, conf=self.conf_threshold, verbose=False)
+        results = self.model.predict(image, conf=self.conf_threshold, verbose=False, device=self.device)
         detections = []
         if len(results) > 0 and results[0].boxes is not None:
             boxes = results[0].boxes
@@ -264,7 +290,7 @@ class YOLOWorldDetector:
 
     def _auto_detect_coco(self, image: np.ndarray) -> List[Dict]:
         """COCO 自动检测: 全类检测 → 过滤背景 → 返回前景候选列表"""
-        results = self.model.predict(image, conf=self.conf_threshold, verbose=False)
+        results = self.model.predict(image, conf=self.conf_threshold, verbose=False, device=self.device)
         all_dets = []
         if len(results) > 0 and results[0].boxes is not None:
             boxes = results[0].boxes

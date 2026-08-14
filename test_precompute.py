@@ -141,15 +141,33 @@ def main():
     print("\n[M2] Detecting object (depth-verified)...")
     yolo = YOLOWorldDetector(
         model_path="/mnt/20T/xieyongling/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
-        device=device, conf_threshold=0.20, use_world=False)
+        device=device, conf_threshold=0.20, use_world=True)
 
-    if args.prompt:
-        detection = yolo.detect_top1(frames[0], args.prompt)
-        detect_mode = f"prompt='{args.prompt}'"
-    else:
-        detection = yolo.auto_detect(frames[0], depth_m=depth_0)
-        detect_mode = "auto-detect (COCO+depth)"
-
+    # ── 多帧检测: 首帧目标不清晰时, 自动尝试 1/4, 1/2, 3/4, 9/10 处帧 ──
+    detect_idx = 0
+    detect_rgb = first_rgb
+    depth_det = depth_0
+    detection = None
+    detect_mode = ""
+    _DETECT_RATIOS = [0.0, 0.25, 0.5, 0.75, 0.9]
+    for _ratio in _DETECT_RATIOS:
+        _fi = int(_ratio * (n_frames - 1))
+        _rgb = cv2.cvtColor(frames[_fi], cv2.COLOR_BGR2RGB)
+        if args.prompt:
+            _det = yolo.detect_top1(frames[_fi], args.prompt)
+        else:
+            # 自动检测需要该帧深度做平面验证
+            _depth_i, _ = depth_estimator.estimate_da3(_rgb)
+            _det = yolo.auto_detect(frames[_fi], depth_m=_depth_i)
+        if _det is not None:
+            detection = _det
+            detect_idx = _fi
+            detect_rgb = _rgb
+            if not args.prompt:
+                depth_det = _depth_i
+            detect_mode = f"prompt='{args.prompt}'@f{_fi}" if args.prompt \
+                else f"auto-detect@f{_fi}"
+            break
     yolo.unload(); del yolo; gcuda()
 
     if detection is None:
@@ -162,6 +180,7 @@ def main():
         if detection is None:
             print("  FATAL: No objects at all. Check video.")
             return
+        detect_mode = "auto-detect@f0 (YOLO-World fallback)" 
 
     print(f"  Detection ({detect_mode}): {detection['label']} "
           f"score={detection['score']:.3f} "
@@ -176,7 +195,7 @@ def main():
     sam = EfficientViTSAMSegmentor(
         model_path="/mnt/20T/xieyongling/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt",
         model_name="efficientvit-sam-l0", device=device)
-    mask_0 = sam.segment_with_box(first_rgb, bbox)
+    mask_0 = sam.segment_with_box(detect_rgb, bbox)
     sam.unload(); del sam; gcuda()
     print(f"  Mask: {mask_0.sum()}px ({100*mask_0.sum()/mask_0.size:.1f}% of frame)")
 
@@ -205,7 +224,7 @@ def main():
     )
     try:
         mesh_path, mesh_info = triposr.generate(
-            first_rgb, mask_0, output_name="proxy_mesh")
+            detect_rgb, mask_0, output_name="proxy_mesh")
         print(f"  Mesh: {mesh_info['vertices']}v/{mesh_info['faces']}f, "
               f"source={mesh_info.get('source','?')}, path={mesh_path}")
     except Exception as e:
@@ -219,7 +238,7 @@ def main():
     aligner = MeshDepthAligner(
         method="depth_guided", default_object_size_mm=100.0)
     aligned_path, scale_mm = aligner.align(
-        mesh_path=mesh_path, depth_m=depth_0, mask=mask_0, K=K,
+        mesh_path=mesh_path, depth_m=depth_det, mask=mask_0, K=K,
         output_dir=os.path.join(args.output, "meshes"))
     print(f"  Scale factor: {scale_mm:.1f} (mesh -> mm)")
     print(f"  Aligned mesh: {aligned_path}")
@@ -286,8 +305,48 @@ def main():
             model_path="/mnt/20T/xieyongling/zhijiyige/weights/xmem/XMem-s012.pth",
             device=device, resolution=720,
             segment_length=200, segment_overlap=5)
+
+        # ── XMem 自动恢复: 掩码丢失时重新检测+分割, 重新初始化 XMem ──
+        _recover_yolo = None
+        _recover_sam = None
+        def _load_recovery_models():
+            nonlocal _recover_yolo, _recover_sam
+            if _recover_yolo is None:
+                _recover_yolo = YOLOWorldDetector(
+                    model_path="/mnt/20T/xieyongling/zhijiyige/weights/yolo_world/yolov8s-worldv2.pt",
+                    device=device, conf_threshold=0.20, use_world=True)
+                _recover_sam = EfficientViTSAMSegmentor(
+                    model_path="/mnt/20T/xieyongling/zhijiyige/weights/efficientvit_sam/efficientvit_sam_l0.pt",
+                    model_name="efficientvit-sam-l0", device=device)
+            return _recover_yolo, _recover_sam
+
+        def recovery_fn(frame_bgr, frame_idx):
+            """掩码丢失时恢复: 重新检测+分割, 返回新掩码 (或 None)"""
+            y, s = _load_recovery_models()
+            if args.prompt:
+                det = y.detect_top1(frame_bgr, args.prompt)
+            else:
+                det = y.auto_detect(
+                    frame_bgr, depth_m=depths_mmap[frame_idx].astype(np.float32))
+            if det is None:
+                return None
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            bbox = np.array(det["bbox"], dtype=np.float32)
+            mask = s.segment_with_box(rgb, bbox)
+            if mask is None:
+                return None
+            return mask.astype(np.uint8)
+
         masks_mmap = propagator.propagate(
-            frames, mask_0, output_memmap=mask_xmem_path)
+            frames, mask_0, output_memmap=mask_xmem_path,
+            recovery_fn=recovery_fn, loss_ratio=0.15, lost_frames=5)
+
+        # 卸载恢复用检测/分割模型 (XMem 已完成)
+        if _recover_yolo is not None:
+            _recover_yolo.unload(); del _recover_yolo
+        if _recover_sam is not None:
+            _recover_sam.unload(); del _recover_sam
+        gcuda()
         propagator.unload(); del propagator; gcuda()
 
         # 校验 XMem 输出 (掩码应平滑连贯, 帧间无跳变)

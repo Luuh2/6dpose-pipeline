@@ -39,7 +39,27 @@ DEPTHS = f'{OUT}/intermediate/depths_metric.dat'
 MASKS = f'{OUT}/intermediate/masks_xmem_full.dat'
 MESH = f'{OUT}/meshes/proxy_mesh_stream3d_mm.glb'
 K_PATH = f'{OUT}/K.npy'
+# ── CLI 覆盖 (多场景测试) ──────────────────────────────────────────
+import argparse as _argparse
+_ap = _argparse.ArgumentParser()
+_ap.add_argument('--out', default=None, help='输出目录 (相对 BASE, 如 output_driller)')
+_ap.add_argument('--video', default=None, help='视频路径 (相对 BASE, 如 demo/driller.mp4)')
+_ap.add_argument('--mesh', default=None, help='mesh 路径 (相对 BASE 或绝对)')
+_ap.add_argument('--npts', type=int, default=None, help='覆盖 N_PTS (GPU 资源受限时降采样)')
+_argv, _ = _ap.parse_known_args()
+if _argv.out:
+    OUT = f'{BASE}/{_argv.out}'
+    DEPTHS = f'{OUT}/intermediate/depths_metric.dat'
+    MASKS = f'{OUT}/intermediate/masks_xmem_full.dat'
+    MESH = f'{OUT}/meshes/proxy_mesh_aligned.glb'
+    K_PATH = f'{OUT}/K.npy'
+if _argv.video:
+    VIDEO = _argv.video if _argv.video.startswith('/') else f'{BASE}/{_argv.video}'
+if _argv.mesh:
+    MESH = _argv.mesh if _argv.mesh.startswith('/') else f'{BASE}/{_argv.mesh}'
 N_PTS = 8000
+if _argv.npts:
+    N_PTS = _argv.npts
 DEBUG = 0
 REANCHOR_EVERY = 30     # 每 N 帧用掩码质心重锚定一次 (防漂移)
 MIN_MASK_PX = 100       # 掩码质心有效的最小面积
@@ -60,6 +80,7 @@ COLOR_FALLBACK_EVERY = 15    # 颜色检测失败时, 尝试一次大范围搜�
 # track_one 无法分辨物体旋转 (单目深度噪声 + 低纹理).
 # 用黄色连通域的惯性主轴角 (图像平面朝向) 每帧修正 pose 翻滚角 (roll).
 AXIS_GUIDE_ENABLED = True    # 启用主轴朝向修正
+AXIS_MIN_ELONGATION = 1.5    # mask 长宽比低于此值(端向/圆)跳过翻滚修正
 AXIS_MAX_DELTA_DEG = 8.0     # 静止时单帧最大翻滚角修正 (度), 防跳变
 AXIS_HISTORY = 5             # 主轴角平滑窗口 (帧)
 
@@ -86,6 +107,7 @@ INIT_AXIS_MAX_DEG = 30.0       # 首帧 roll 修正限幅 (大, 因初始化可�
 CONFIDENCE_CHECK_ENABLED = True
 CONFIDENCE_THRESHOLD = 0.22    # IoU 低于此值触发重注册 (追踪bbox是AABB含空隙, 正常IoU~0.3)
 CONFIDENCE_CHECK_EVERY = 30    # 每 N 帧检查一次
+CONFIDENCE_CONSEC = 2        # 连续 N 次低 IoU 才重注册 (防单帧抖动)
 
 # ── 旋转一致性校验 (防止跳到对称歧义解) ────────────────────────────
 # 物体旋转连续, 两帧间三轴方向不应突变. RefineNet 可能跳到对称歧义解
@@ -104,6 +126,7 @@ DEPTH_BILATERAL_SIGMA = 3.0  # 双边滤波空间/色彩 sigma
 # ── LIEKF 在线融合参数 ─────────────────────────────────────────────
 # 将平移观测 (颜色质心) + 旋转观测 (主轴角) 接入 SE(3)-LIEKF 一同滤波
 LIEKF_ENABLED = True
+LIEKF_STATIC_V_THRESH = 0.2  # motion_level 低于此值=静止, 速度归零防漂移
 LIEKF_PROCESS_POS = 0.005    # 位置过程噪声
 LIEKF_PROCESS_ROT = 0.002    # 旋转过程噪声
 LIEKF_MEAS_POS = 0.002       # 位置测量噪声 (颜色质心可靠, 较小)
@@ -204,8 +227,6 @@ mesh_bbox_corners = np.array([
 ], dtype=np.float32)
 print(f'  mesh bbox corners: {mesh_bbox_corners.shape}')
 # ── 物体本体长轴 (bbox 最长边): 从固定网格一次性定义, 永久固定 ──
-# 轴修正 (mask 惯性主轴 / 主轴预测) 一律对齐此固定本体轴,
-# 不随当前帧点云/网格重新生成坐标轴。
 long_axis_idx = int(np.argmax(mx - mn))
 _axis_names = ['X', 'Y', 'Z']
 print(f'  [BodyFrame] 本体长轴 = {_axis_names[long_axis_idx]}'
@@ -226,7 +247,7 @@ fp = FoundationPose(
     glctx=glctx, debug=DEBUG, debug_dir=os.path.join(OUT, "fp_debug"),
 )
 # 降低 rotation grid 以适配 6GB VRAM
-fp.make_rotation_grid(min_n_views=16, inplane_step=60)
+fp.make_rotation_grid(min_n_views=8, inplane_step=120)
 print(f'  rotation grid: {len(fp.rot_grid)} rots')
 print(f'  VRAM: {torch.cuda.memory_allocated()/1e9:.2f}GB')
 
@@ -503,6 +524,22 @@ def mask_centroid_and_axis(mask):
             2 * moments['mu11'], moments['mu20'] - moments['mu02'])
     return c2d, axis_angle
 
+def mask_elongation(mask):
+    """mask 长宽比 (主轴/垂直轴 std). 细长→可靠; 近圆→端向不可靠."""
+    m = mask.astype(np.uint8)
+    mom = cv2.moments(m)
+    if mom['mu20'] + mom['mu02'] < 1e-6:
+        return 1.0
+    ang = 0.5 * np.arctan2(2 * mom['mu11'], mom['mu20'] - mom['mu02'])
+    u = np.array([np.cos(ang), np.sin(ang)]); v = np.array([-u[1], u[0]])
+    ys, xs = np.where(m > 0)
+    if len(ys) < 50:
+        return 1.0
+    cx = mom['m10']/mom['m00']; cy = mom['m01']/mom['m00']
+    pts = np.stack([xs-cx, ys-cy], 1)
+    sm = float(np.std(pts @ u)); ss = float(np.std(pts @ v))
+    return sm/ss if ss > 1e-6 else 1.0
+
 def apply_bbox_align_pose_fix(pose, mask, depth, K, corners, max_shift_px=15.0):
     """将 pose 的 2D 投影 bbox 中心对齐到 mask 的 2D bbox 中心
 
@@ -554,6 +591,8 @@ prev_xmem_axis = None      # 上一帧主轴角 (运动检测)
 motion_level = 0.0         # 当前运动强度 [0,1]
 prev_pose_stable = None    # 上一帧稳定姿态 (旋转一致性校验基准)
 n_rot_reject = 0           # 对称歧义解被拒绝次数
+n_flip_fix = 0              # 翻转守护修正次数
+_low_conf_count = 0          # 连续低 IoU 计数
 
 for i in range(n):
     rgb = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
@@ -674,6 +713,8 @@ for i in range(n):
 
     # ── 每帧引导修正 (XMem mask 优先, 颜色检测回退) ──
     if i > 0 and (COLOR_GUIDE_ENABLED or AXIS_GUIDE_ENABLED):
+        # mask 长宽比: 端向(圆)时主轴不可靠, 用于门控翻滚修正 (防 180° 翻转)
+        _mask_elong = mask_elongation(mask)
         # 1) 优先用 XMem 掩码 (精确轮廓) 计算质心 + 主轴
         xmem_c2d, xmem_axis = mask_centroid_and_axis(mask)
         if xmem_c2d is not None:
@@ -684,8 +725,9 @@ for i in range(n):
                 prev_bottle_center = xmem_c2d
                 if np.max(np.abs(pose[:3, 3] - pose_before[:3, 3])) > 1e-7:
                     n_color_fix += 1
-            # 翻滚: mask 惯性主轴 → pose 翻滚角
-            if AXIS_GUIDE_ENABLED and xmem_axis is not None:
+            # 翻滚: mask 惯性主轴 → pose 翻滚角 (门控: 端向跳过)
+            if (AXIS_GUIDE_ENABLED and xmem_axis is not None
+                    and _mask_elong >= AXIS_MIN_ELONGATION):
                 axis_s = smooth_axis(xmem_axis, motion_level)
                 pose_before = pose.copy()
                 pose = apply_axis_pose_fix(pose, axis_s, K, motion_level)
@@ -708,7 +750,7 @@ for i in range(n):
                     pose = apply_2d_pose_fix(pose, c2d_s, depth, K)
                     prev_bottle_center = c2d_s
                     n_color_fix += 1
-                if AXIS_GUIDE_ENABLED:
+                if AXIS_GUIDE_ENABLED and _mask_elong >= AXIS_MIN_ELONGATION:
                     axis_s = smooth_axis(axis_angle, motion_level)
                     pose_before = pose.copy()
                     pose = apply_axis_pose_fix(pose, axis_s, K, motion_level)
@@ -728,14 +770,14 @@ for i in range(n):
 
     # ── SE(3)-LIEKF 在线融合 (平移 + 旋转观测) ──
     if i > 0 and kf is not None:
+        if motion_level < LIEKF_STATIC_V_THRESH:
+            kf.v = np.zeros(6)  # 静止: 速度归零, 停止积分, 杜绝滚转漂移
         kf.predict()
         kf.update(pose)  # pose 已含颜色质心 + 主轴观测修正
         pose = kf.X.copy()
         sync_pose_last(fp, pose)
     elif i > 0:
         sync_pose_last(fp, pose)
-
-    # ── ③ 姿态置信度校验 (几何一致性, 低置信触发重注册兜底) ──
     # 直接用 scorer.predict 单独评分会额外加载 H5Dataset 导致 OOM/WSL 崩溃.
     # 改用几何一致性置信度: 追踪 bbox 投影 vs XMem mask 的 IoU.
     # (ScoreNet 首帧已在 register 内打分, 后续用 IoU 反映追踪贴合度)
@@ -750,25 +792,41 @@ for i in range(n):
             x1, y1 = int(img[:, 0].min()), int(img[:, 1].min())
             x2, y2 = int(img[:, 0].max()), int(img[:, 1].max())
             x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(479, x2), min(359, y2)
+            x2, y2 = min(wp - 1, x2), min(hp - 1, y2)  # 用实际帧尺寸, 勿硬编码 360p
             track_bb = np.zeros_like(mask)
             track_bb[y1:y2, x1:x2] = 1
             inter = np.logical_and(track_bb > 0, mask > 0).sum()
             union = np.logical_or(track_bb > 0, mask > 0).sum()
             iou = inter / max(union, 1)
-            # IoU 低 → 追踪偏移 → 触发重注册兜底
+            # IoU 低 → 追踪偏移 → 连续多次才触发重注册兜底 (防单帧抖动)
             if iou < CONFIDENCE_THRESHOLD:
-                print(f'  [Conf@{i}] IoU={iou:.3f} < {CONFIDENCE_THRESHOLD}, re-register...')
+                _low_conf_count += 1
+            else:
+                _low_conf_count = 0
+            if iou < CONFIDENCE_THRESHOLD and _low_conf_count >= CONFIDENCE_CONSEC:
+                print(f'  [Conf@{i}] IoU={iou:.3f} < {CONFIDENCE_THRESHOLD} '
+                      f'x{_low_conf_count}, re-register...')
                 # 重新 register (带 mask 背景屏蔽) 兜底修正朝向
                 if INIT_MASK_BACKGROUND:
                     mask_bool = (mask > 0)
                     rgb_rr = np.where(mask_bool[..., None], rgb, 0).astype(np.uint8)
                     depth_rr = np.where(mask_bool, depth, 0.0).astype(np.float32)
-                    pose = fp.register(K=K, rgb=rgb_rr, depth=depth_rr,
-                                       ob_mask=mask, ob_id=0, iteration=2)
+                    pose_new = fp.register(K=K, rgb=rgb_rr, depth=depth_rr,
+                                           ob_mask=mask, ob_id=0, iteration=2)
                 else:
-                    pose = fp.register(K=K, rgb=rgb, depth=depth,
-                                       ob_mask=mask, ob_id=0, iteration=2)
+                    pose_new = fp.register(K=K, rgb=rgb, depth=depth,
+                                           ob_mask=mask, ob_id=0, iteration=2)
+                # 平滑: 与当前 pose 插值, 避免跳变 (SE(3) 加权)
+                from scipy.spatial.transform import Rotation as _Rot
+                _Rc = _Rot.from_matrix(pose[:3, :3].copy())
+                _Rn = _Rot.from_matrix(pose_new[:3, :3])
+                _k = 0.2  # 朝向新 pose 20% (更平滑, 防跳变)
+                _old_t = pose[:3, 3].copy()
+                _R_mix = _Rc.inv() * _Rn
+                _axis = _R_mix.as_rotvec() * _k
+                pose = np.eye(4)
+                pose[:3, :3] = (_Rot.from_rotvec(_axis) * _Rc).as_matrix()
+                pose[:3, 3] = _old_t + _k * (pose_new[:3, 3] - _old_t)
                 # 重新应用主轴 roll 约束
                 _, xmem_axis_r = mask_centroid_and_axis(mask)
                 if xmem_axis_r is not None:
@@ -777,6 +835,7 @@ for i in range(n):
                 if kf is not None:
                     kf.initialize(pose)
                 sync_pose_last(fp, pose)
+                _low_conf_count = 0
                 print(f'  [Conf@{i}] re-registered, IoU corrected')
         except Exception as e:
             # 校验失败不阻塞追踪
