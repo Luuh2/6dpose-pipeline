@@ -1,0 +1,3 @@
+# 实验记录 2026-08-20
+
+管线资源画像 + 服务器环境修复。①资源画像（720p/414帧，分模块微基准）：M8 FoundationPose 峰值显存 **8.3GB**（register+track，N_PTS=8000）、M6 TripoSR 3.8GB、M4 XMem 2.9GB、M5 DA3 2.1GB，M2/M3 均 <300MB；数组 frames 1145MB、mask 382MB、depth 763MB；结论 720p 峰值 8.3GB 超 3060 6GB 预算，需降 360p+减小采样点。②环境修复：服务器 `ego_env` 被移除、换为依赖不完整的 `ego_fa_env`（代码完好），批量补装 12 项依赖（ultralytics/omegaconf/timm/transformers==4.35/hf==0.23.5/evo/onnx/onnxsim/segment-anything/PyMCubes/rembg+onnxruntime/warp-lang/ninja），源码编译 pytorch3d 0.7.9（需 `--no-build-isolation`）与 nvdiffrast（修 setup.py 硬编码的 `/root/miniconda3/envs/rgb6d` CUDA 路径为 `/usr/local/cuda`）；TripoSR 网格提取失败系装了同名错包 `mcubes 0.1.6`（应装 `PyMCubes`），修复后生成真实网格 13574v。修复后完整预计算+追踪在 ego_fa_env 端到端跑通（检测/XMem/DA3/TripoSR/FP 全正常）。
